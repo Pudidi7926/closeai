@@ -222,8 +222,13 @@ export default function App() {
         setIsFetchingLinks(false);
       }
 
+      const groqApiKey = process.env.GROQ_API_KEY;
+      if (!groqApiKey) {
+        throw new Error("GROQ_API_KEY tidak ditemukan. Silakan tambahkan API Key di panel Secrets.");
+      }
+
       const groq = new Groq({
-        apiKey: process.env.GROQ_API_KEY,
+        apiKey: groqApiKey,
         dangerouslyAllowBrowser: true,
       });
 
@@ -234,41 +239,26 @@ export default function App() {
       ];
 
       currentConvo?.messages.forEach(m => {
-        const content: any[] = [{ type: 'text', text: m.content }];
-        m.attachments?.forEach(at => {
-          if (at.type === 'image') {
-            content.push({
-              type: 'image_url',
-              image_url: { url: at.url }
-            });
-          }
-        });
-        messages.push({ role: m.role === 'model' ? 'assistant' : 'user', content });
+        // Groq only supports text in content for non-vision models, 
+        // and for vision models it requires specific array structure.
+        // We will default to a stable model.
+        messages.push({ role: m.role === 'model' ? 'assistant' : 'user', content: m.content });
       });
 
       // Add current message
-      const currentContent: any[] = [{ type: 'text', text: finalInput + contextFromLinks }];
-      userMsg.attachments?.forEach(at => {
-        if (at.type === 'image') {
-          currentContent.push({
-            type: 'image_url',
-            image_url: { url: at.url }
-          });
-        }
-      });
-      messages.push({ role: 'user', content: currentContent });
+      messages.push({ role: 'user', content: finalInput + contextFromLinks });
 
       // Retry Logic
       let chatCompletion;
       let retries = 0;
       const MAX_RETRIES = 3;
       
-      // Select model based on presence of images or requested mode
-      const hasImages = messages.some(m => Array.isArray(m.content) && m.content.some((c: any) => c.type === 'image_url'));
-      const model = hasImages ? 'llama-3.2-11b-vision' : 'llama-3.3-70b-versatile';
+      // Select model - llama-3.3-70b-versatile is currently the most stable and powerful versatile model
+      const model = 'llama-3.3-70b-versatile';
 
       while (retries < MAX_RETRIES) {
         try {
+          console.log('Using model:', model); // Debugging
           chatCompletion = await groq.chat.completions.create({
             messages: messages,
             model: model,
