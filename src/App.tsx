@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { GoogleGenAI, ThinkingLevel } from '@google/genai';
+import Groq from 'groq-sdk';
 import { 
   Plus, 
   MessageSquare, 
@@ -49,7 +49,7 @@ const INITIAL_SYSTEM_INSTRUCTION = (prefs: UserPreferences) => {
     default: modeInstruction = "Maintain a helpful and balanced tone.";
   }
 
-  return `You are "${prefs.personaName || 'Close AI'}", a highly intelligent, empathetic, and sophisticated digital assistant.
+  return `You are "${prefs.personaName || 'Close AI'}", a highly intelligent, empathetic, and sophisticated digital assistant powered by Llama models from GroqCloud.
 The user is ${prefs.userName}. Your speaking style is ${prefs.speakingStyle || 'casual'}.
 AI Mode Active: ${prefs.aiMode.toUpperCase()}. ${modeInstruction}
 ${prefs.customInstructions ? `Additional Instructions: ${prefs.customInstructions}` : ''}
@@ -222,54 +222,73 @@ export default function App() {
         setIsFetchingLinks(false);
       }
 
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      const groq = new Groq({
+        apiKey: process.env.GROQ_API_KEY,
+        dangerouslyAllowBrowser: true,
+      });
+
       const currentConvo = conversations.find(c => c.id === currentConvoId);
       
-      const contents = currentConvo?.messages.map(m => {
-        const parts: any[] = [{ text: m.content }];
+      const messages: any[] = [
+        { role: 'system', content: INITIAL_SYSTEM_INSTRUCTION(preferences) }
+      ];
+
+      currentConvo?.messages.forEach(m => {
+        const content: any[] = [{ type: 'text', text: m.content }];
         m.attachments?.forEach(at => {
-          if (at.type === 'image' || at.type === 'video') {
-            parts.push({
-              inlineData: {
-                data: at.url.split(',')[1],
-                mimeType: at.mimeType
-              }
+          if (at.type === 'image') {
+            content.push({
+              type: 'image_url',
+              image_url: { url: at.url }
             });
-          } else {
-            parts.push({ text: `[Attached File: ${at.name}]` });
           }
         });
-        return { role: m.role, parts };
-      }) || [];
+        messages.push({ role: m.role === 'model' ? 'assistant' : 'user', content });
+      });
 
-      // Add current message with potential link context
-      const currentParts: any[] = [{ text: finalInput + contextFromLinks }];
+      // Add current message
+      const currentContent: any[] = [{ type: 'text', text: finalInput + contextFromLinks }];
       userMsg.attachments?.forEach(at => {
-        if (at.type === 'image' || at.type === 'video') {
-          currentParts.push({
-            inlineData: {
-              data: at.url.split(',')[1],
-              mimeType: at.mimeType
-            }
+        if (at.type === 'image') {
+          currentContent.push({
+            type: 'image_url',
+            image_url: { url: at.url }
           });
         }
       });
+      messages.push({ role: 'user', content: currentContent });
 
-      contents.push({ role: 'user', parts: currentParts });
+      // Retry Logic
+      let chatCompletion;
+      let retries = 0;
+      const MAX_RETRIES = 3;
+      
+      // Select model based on presence of images or requested mode
+      const hasImages = messages.some(m => Array.isArray(m.content) && m.content.some((c: any) => c.type === 'image_url'));
+      const model = hasImages ? 'llama-3.2-11b-vision-preview' : 'llama-3.3-70b-versatile';
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: contents,
-        config: {
-          systemInstruction: INITIAL_SYSTEM_INSTRUCTION(preferences),
-          temperature: preferences.aiMode === 'math' ? 0.1 : (preferences.aiMode === 'critical' ? 1.0 : 0.7),
-          topP: 0.95,
-          topK: 40,
-          maxOutputTokens: 8192,
+      while (retries < MAX_RETRIES) {
+        try {
+          chatCompletion = await groq.chat.completions.create({
+            messages: messages,
+            model: model,
+            temperature: preferences.aiMode === 'math' ? 0.1 : (preferences.aiMode === 'critical' ? 1.0 : 0.7),
+            max_completion_tokens: 4096,
+            top_p: 1,
+            stop: null,
+            stream: false,
+          });
+          break; 
+        } catch (e: any) {
+          retries++;
+          if (retries >= MAX_RETRIES || !e.message?.includes('503')) throw e;
+          await new Promise(r => setTimeout(r, Math.pow(2, retries - 1) * 1000));
         }
-      });
+      }
 
-      const aiText = response.text || '';
+      if (!chatCompletion) throw new Error("Gagal mendapatkan respon dari Groq.");
+
+      const aiText = chatCompletion.choices[0]?.message?.content || '';
       
       // Check for code/html for canvas
       if (aiText.includes('```html') || aiText.includes('```markdown') || aiText.includes('<!DOCTYPE html>')) {
@@ -297,10 +316,16 @@ export default function App() {
       ));
     } catch (error: any) {
       console.error('Error:', error);
+      let friendlyError = `Terjadi kesalahan sistem: ${error.message || 'Unknown error'}.`;
+      
+      if (error.message?.includes('503') || error.message?.includes('high demand') || error.message?.includes('rate_limit')) {
+        friendlyError = "Layanan sedang sibuk atau mencapai batas. AI akan otomatis mencoba kembali atau silakan kirim ulang pesan Anda.";
+      }
+
       const errorMsg: Message = {
         id: (Date.now() + 1).toString(),
         role: 'model',
-        content: `Terjadi kesalahan sistem: ${error.message || 'Unknown error'}. Silakan periksa koneksi internet atau coba lagi.`,
+        content: friendlyError,
         timestamp: Date.now(),
       };
       setConversations(prev => prev.map(c => 
@@ -445,7 +470,7 @@ export default function App() {
               <h2 className="font-bold text-lg font-serif">{activeConversation?.title || 'Selamat Datang'}</h2>
               <div className="flex items-center gap-2">
                 <div className="w-1.5 h-1.5 rounded-full bg-green-500" />
-                <span className="text-[10px] font-bold uppercase tracking-widest text-gray-400">Gemini 3 Pro Active</span>
+                <span className="text-[10px] font-bold uppercase tracking-widest text-gray-400">Groq Llama 3 Active</span>
               </div>
             </div>
           </div>
@@ -637,7 +662,7 @@ export default function App() {
               </div>
             </div>
             <p className="text-[10px] text-center mt-4 text-gray-400 font-bold uppercase tracking-widest leading-loose">
-              Didukung oleh Gemini 3 & Close AI Core. Semua data terenkripsi lokal.
+              Didukung oleh Llama GroqCloud & Close AI Core. Semua data terenkripsi lokal.
             </p>
           </div>
         </div>
